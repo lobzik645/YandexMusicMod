@@ -1,0 +1,46 @@
+import { initFetchInterceptor } from "~/mod/features/utils";
+
+// Инициализация мода utils для перехвата запросов к yandex api
+initFetchInterceptor();
+
+// Инициализация мода на разблокировку плюса
+import "./features/plus-unlocker";
+
+// Инициализация интерфейса мода
+import "./features/ui/index";
+
+// Инициализация мода на изменение шрифта
+import "./features/font-changer";
+
+// Инициализация мода на изменение размера интерфейса
+import "./features/scale-changer";
+
+// Инициализация мода на кастомные темы
+import "./features/custom-themes";
+
+// Инициализация мода на режим разработчика
+import "./features/devtools";
+
+// Инициализация мода авто-выбора качества
+import "./features/auto-best-quality";
+
+// Инициализация renderer части мода discordRPC
+import "./features/discord-RPC/discordRPC";
+
+// Инициализация settings
+import "./features/settings";
+
+// Инициализация мода для переопределения экспериментов
+import "./features/experiments-toggle";
+
+// Инициализация мода анти-цензуры YMLiberty
+import "./features/ym-liberty";
+
+// Инициализация кастомного фона (видео / изображения)
+import "./features/custom-background";
+
+// Инициализация медиа-клавиш и глобальных хоткеев переключения треков
+import "./features/media-keys";
+
+// Инициализация отслеживания статистики
+import "./features/stats/stats-tracker";
