@@ -29,10 +29,6 @@
   <img src="./docs/custom-background-2.png" alt="Анимированный GIF фон и кастомный шрифт" width="49%" />
 </p>
 
-<p align="center">
-  <img src="./docs/preview-5.117.1.png" alt="Основной интерфейс мода" width="90%" />
-</p>
-
 ---
 
 ## ✨ Основные возможности
