@@ -37,7 +37,7 @@ export function Settings() {
       const experimentsResponse = await axios.get("https://api.music.yandex.net/account/experiments/details", {
         method: "GET",
         headers: {
-          "x-yandex-music-client": "YandexMusicDesktopAppWindows/" + (window.VERSION || "5.121.2"),
+          "x-yandex-music-client": "YandexMusicDesktopAppWindows/" + (window.VERSION || "5.127.0"),
           "x-yandex-music-without-invocation-info": "1",
           Authorization: accessToken,
         },

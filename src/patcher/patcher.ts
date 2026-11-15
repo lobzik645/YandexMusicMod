@@ -158,7 +158,7 @@ export async function processBuild(build: AppBuild) {
     ),
   );
   packageJsonContents.name = "YandexMusicMod";
-  packageJsonContents.author = "HoleverGG [github.com/HoleverGG]";
+  packageJsonContents.author = "lobzik645 [github.com/lobzik645]";
   packageJsonContents.build = {
     appId: "ru.yandex.desktop.music.mod",
     productName: "Яндекс Музыка",

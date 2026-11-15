@@ -36,6 +36,9 @@ import "./features/experiments-toggle";
 // Инициализация мода анти-цензуры YMLiberty
 import "./features/ym-liberty";
 
+// Инициализация кнопки «Скачать трек» в контекстном меню плеера
+import "./features/context-menu-download";
+
 // Инициализация кастомного фона (видео / изображения)
 import "./features/custom-background";
 
@@ -44,3 +47,6 @@ import "./features/media-keys";
 
 // Инициализация отслеживания статистики
 import "./features/stats/stats-tracker";
+
+// ВРЕМЕННЫЙ самотест диагностики (удалить после отладки) — сейчас отключён
+// import "./features/self-test";

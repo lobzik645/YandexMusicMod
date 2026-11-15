@@ -131,6 +131,24 @@ export function getProgress(): Result<PlayerProgress, string> {
   return ok({ duration: 180, position: 0, progress: 0 });
 }
 
+// Числовой id текущего играющего трека (для скачивания), либо null.
+// Основной источник — fiber-метаданные плеер-бара, остальные — запасные.
+export function getCurrentNumericTrackId(): string | null {
+  const metaRequest = getTrackMeta();
+  if (metaRequest.isOk()) {
+    const id = String(metaRequest.value?.id ?? "");
+    if (/^\d+$/.test(id)) return id;
+  }
+
+  const entity = (window as any).pulsesyncApi?.getCurrentTrack?.();
+  if (entity?.id && /^\d+$/.test(String(entity.id))) return String(entity.id);
+
+  const sonataId = (window as any).sonataState?.queueState?.currentEntity?.value?.entity?.entityData?.meta?.id;
+  if (sonataId && /^\d+$/.test(String(sonataId))) return String(sonataId);
+
+  return null;
+}
+
 export function getTrackMeta(): Result<any, string> {
   const player = getPlayer();
   let meta: any = null;

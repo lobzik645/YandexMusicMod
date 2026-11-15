@@ -1,3 +1,5 @@
+import { toast } from "sonner";
+
 import { getTrackMeta, isPlaying, getProgress } from "~/mod/features/utils/player";
 
 interface DayStats {
@@ -102,7 +104,24 @@ function checkAndCredit(session: ActiveTrackSession, day: DayStats) {
 
     dirty = true;
     saveStats();
+    maybeFireMilestone();
     console.log(`[Stats] Track counted (listened to end): ${session.meta?.title || session.trackId} (${Math.round(session.listenedSec)}s / ${Math.round(dur)}s)`);
+  }
+}
+
+// Вехи: каждые 1000 прослушанных треков — конфетти и тост.
+// ВАЖНО: только статический импорт — динамический import() добавляет в бандл
+// vite-хелпер с import.meta.url, а renderer.js грузится классическим (не module)
+// скриптом и падает с SyntaxError: Cannot use 'import.meta' outside a module
+function maybeFireMilestone() {
+  try {
+    const total = Object.values(statsData.dailyStats).reduce((sum, d) => sum + d.tracksPlayed, 0);
+    if (total > 0 && total % 1000 === 0) {
+      window.dispatchEvent(new CustomEvent("luna-milestone", { detail: { total } }));
+      toast("🎉 Веха!", { description: `Прослушано ${total} треков через Luna mod` });
+    }
+  } catch (e) {
+    // ignore
   }
 }
 
@@ -258,6 +277,11 @@ export function resetStats() {
   activeSession = null;
   dirty = true;
   saveStats();
+}
+
+// Сырые данные статистики для экспорта (CSV/JSON)
+export function getRawStats(): StatsData {
+  return JSON.parse(JSON.stringify(statsData));
 }
 
 export { loadStats };

@@ -7,6 +7,19 @@ const axios = require("axios");
 const http = require("http");
 const url = require("url");
 
+// Лог консоли рендера (мод+приложение) в файл — диагностика ошибок скачивания.
+// main.js инлайнится в начало index.js, поэтому переключатели выставляются раньше кода приложения.
+try {
+  const rendererLogDir = path.join(
+    process.env.APPDATA || electron.app.getPath("userData"),
+    "YandexMusicMod",
+    "logs",
+  );
+  fs.mkdirSync(rendererLogDir, { recursive: true });
+  electron.app.commandLine.appendSwitch("enable-logging", "file");
+  electron.app.commandLine.appendSwitch("log-file", path.join(rendererLogDir, "renderer_console.log"));
+} catch (e) {}
+
 // ffmpeg-static (либа которая бандлит бинарники ffmpeg)
 const pathToFfmpeg = require("ffmpeg-static").replaceAll("app.asar", "app.asar.unpacked");
 const { exec } = require("child_process");
@@ -101,6 +114,93 @@ electron.ipcMain.handle("yandexMusicMod.selectBackgroundFile", async (_ev) => {
   }
 
   return { success: true, path: result.filePaths[0] };
+});
+
+// window API - сохранение текстового файла через диалог (экспорт статистики)
+electron.ipcMain.handle("yandexMusicMod.saveFileWithDialog", async (_ev, options) => {
+  try {
+    const { title, defaultFileName, content } = options || {};
+
+    const result = await electron.dialog.showSaveDialog({
+      title: title || "Сохранить файл",
+      defaultPath: defaultFileName || "export.json",
+    });
+
+    if (result.canceled || !result.filePath) {
+      return { success: false, cancelled: true };
+    }
+
+    fs.writeFileSync(result.filePath, content, "utf8");
+    return { success: true, path: result.filePath };
+  } catch (err) {
+    console.error("[SaveFile] Error:", err);
+    return { success: false, error: err.message };
+  }
+});
+
+// window API - экспорт всех настроек мода в файл (бэкап)
+electron.ipcMain.handle("yandexMusicMod.exportModSettings", async () => {
+  try {
+    const settings = JSON.parse(fs.readFileSync(settingsFilePath, "utf8"));
+    const payload = {
+      type: "luna-mod-backup",
+      version: 1,
+      createdAt: new Date().toISOString(),
+      settings,
+    };
+
+    const result = await electron.dialog.showSaveDialog({
+      title: "Сохранить резервную копию настроек",
+      defaultPath: `luna-mod-backup-${new Date().toISOString().slice(0, 10)}.json`,
+      filters: [{ name: "JSON", extensions: ["json"] }],
+    });
+
+    if (result.canceled || !result.filePath) {
+      return { success: false, cancelled: true };
+    }
+
+    fs.writeFileSync(result.filePath, JSON.stringify(payload, null, 2), "utf8");
+    return { success: true, path: result.filePath };
+  } catch (err) {
+    console.error("[Backup] Export error:", err);
+    return { success: false, error: err.message };
+  }
+});
+
+// window API - восстановление настроек мода из файла (бэкап)
+electron.ipcMain.handle("yandexMusicMod.importModSettings", async () => {
+  try {
+    const result = await electron.dialog.showOpenDialog({
+      properties: ["openFile"],
+      title: "Восстановить настройки из резервной копии",
+      filters: [{ name: "JSON", extensions: ["json"] }, { name: "Все файлы (*.*)", extensions: ["*"] }],
+    });
+
+    if (result.canceled || !result.filePaths.length) {
+      return { success: false, cancelled: true };
+    }
+
+    const parsed = JSON.parse(fs.readFileSync(result.filePaths[0], "utf8"));
+    const settings = parsed?.type === "luna-mod-backup" && parsed.settings ? parsed.settings : parsed;
+
+    if (!settings || typeof settings !== "object" || Array.isArray(settings)) {
+      return { success: false, error: "Некорректный файл резервной копии" };
+    }
+
+    fs.writeFileSync(settingsFilePath, JSON.stringify(settings, null, 2));
+
+    // Разослать обновления всем открытым окнам, чтобы настройки применились сразу
+    Object.entries(settings).forEach(([key, value]) => {
+      electron.BrowserWindow.getAllWindows().forEach((window) =>
+        window.webContents.send("yandexMusicMod.storageValueUpdated", key, value),
+      );
+    });
+
+    return { success: true, path: result.filePaths[0] };
+  } catch (err) {
+    console.error("[Backup] Import error:", err);
+    return { success: false, error: err.message };
+  }
 });
 
 // window API - чтение локального файла в Base64 Data URL (гарантирует 100% работу картинок без CORS/file:// ограничений)
@@ -280,10 +380,25 @@ try {
   console.warn("[CORS] Failed to init CORS headers interceptor:", e);
 }
 
+// electron-log приложения — пишем события скачивания в logs/main.log
+let modLog = null;
+try {
+  modLog = require("electron-log");
+} catch (e) {}
+
 // window API - открытие папки для загрузки треков
 electron.ipcMain.handle("yandexMusicMod.openFolder", async (_ev, folderPath) => {
   try {
-    await electron.shell.openPath(folderPath);
+    let target = folderPath;
+    if (!target) {
+      // путь не задан — открываем дефолтную папку загрузок
+      target = defaultDownloadPath;
+      try {
+        const settings = JSON.parse(fs.readFileSync(settingsFilePath, "utf8"));
+        target = settings.downloadFolderPath || target;
+      } catch (e) {}
+    }
+    await electron.shell.openPath(target);
     return { success: true };
   } catch (error) {
     console.error("Failed to open folder:", error);
@@ -291,11 +406,47 @@ electron.ipcMain.handle("yandexMusicMod.openFolder", async (_ev, folderPath) => 
   }
 });
 
+// Активные загрузки: id -> AbortController (для отмены из очереди)
+const activeDownloads = new Map();
+
+function sendDownloadProgress(downloadId, payload) {
+  if (!downloadId) return;
+  electron.BrowserWindow.getAllWindows().forEach((window) => {
+    if (!window.isDestroyed()) {
+      window.webContents.send("yandexMusicMod.downloadProgress", { id: downloadId, ...payload });
+    }
+  });
+}
+
+// window API - отмена загрузки по id
+electron.ipcMain.on("yandexMusicMod.cancelDownload", (_ev, downloadId) => {
+  const controller = activeDownloads.get(downloadId);
+  if (controller) {
+    controller.abort();
+    activeDownloads.delete(downloadId);
+    console.log("[Downloader] Cancelled download:", downloadId);
+  }
+});
+
 // window API - загрузка трека
 electron.ipcMain.handle(
   "yandexMusicMod.downloadTrack",
-  async (_ev, downloadInfo, trackMeta, customDownloadPath = null) => {
-    console.log("Backend get download request: ", downloadInfo.url);
+  async (_ev, downloadInfo, trackMeta, customDownloadPath = null, downloadId = null) => {
+    // Нормализация: get-file-info отдаёт urls[] + url, подменённые треки — directLink
+    const urls = Array.isArray(downloadInfo.urls) ? downloadInfo.urls : [];
+    const candidateUrls = [...new Set([downloadInfo.url, downloadInfo.directLink, ...urls])].filter(
+      (u) => typeof u === "string" && u.length > 0,
+    );
+
+    console.log("Backend get download request: ", candidateUrls[0]);
+
+    if (!candidateUrls.length) {
+      return { ok: false, error: "Не удалось получить ссылку на аудиофайл" };
+    }
+
+    if (candidateUrls.some((u) => u.startsWith("blob:"))) {
+      return { ok: false, error: "Локально подменённый трек нельзя скачать — доступна только оригинальная версия" };
+    }
 
     let saveFolder;
     if (process.platform === "win32") {
@@ -320,7 +471,7 @@ electron.ipcMain.handle(
     }
 
     // Generate filename from trackMeta or use default
-    const fileExtension = downloadInfo.codec.includes("flac") ? "flac" : "mp3";
+    const fileExtension = codecToExtension(downloadInfo.codec);
     const trackFileName = sanitize(
       `${trackMeta.artists.map((a) => a.name).join(", ")} - ${trackMeta.title} ${trackMeta.version || ""}`,
     )
@@ -328,22 +479,86 @@ electron.ipcMain.handle(
       .substring(0, 250);
     const trackFilePath = path.join(saveFolder, `${trackFileName}.${fileExtension}`);
     const trackTempFilePath = path.join(saveFolder, `${Math.random().toString(36).substring(2, 7)}.${fileExtension}`);
-    const trackCoverPath = path.join(saveFolder, `${trackFileName}.jpg`);
+    const trackCoverPath = trackTempFilePath + ".jpg";
 
     try {
-      // Download file using axios with arraybuffer response type
-      const response = await axios.get(downloadInfo.url, {
-        responseType: "arraybuffer",
-        validateStatus: () => true, // Following neverthrow integration pattern
-      });
+      modLog?.info(`[LunaMod] download start: "${trackFileName}.${fileExtension}" -> ${saveFolder} (mirrors: ${candidateUrls.length})`);
+    } catch (e) {}
 
-      if (response.status !== 200) {
-        console.error(`Download failed with status: ${response.status}`);
-        return { ok: false, error: "Download failed" };
+    try {
+      // Download file using axios with arraybuffer response type.
+      // API отдаёт несколько зеркал — пробуем по очереди, если зеркало недоступно
+      let response = null;
+      let lastStatusOrError = null;
+      const abortController = new AbortController();
+      if (downloadId) activeDownloads.set(downloadId, abortController);
+
+      sendDownloadProgress(downloadId, { status: "downloading", loaded: 0, total: 0, speed: 0 });
+
+      for (const candidateUrl of candidateUrls) {
+        let lastReportTime = 0;
+
+        try {
+          const attempt = await axios.get(candidateUrl, {
+            responseType: "arraybuffer",
+            validateStatus: () => true, // Following neverthrow integration pattern
+            timeout: 20000,
+            signal: abortController.signal,
+            onDownloadProgress: (progressEvent) => {
+              // троттлинг: шлём прогресс не чаще 5 раз в секунду
+              const now = Date.now();
+              if (now - lastReportTime < 200) return;
+              lastReportTime = now;
+
+              const prevLoaded = attempt.__lastLoaded || 0;
+              const dt = Math.max(1, now - (attempt.__lastTime || now - 500)) / 1000;
+              const speed = Math.max(0, ((progressEvent.loaded || 0) - prevLoaded) / dt);
+              attempt.__lastLoaded = progressEvent.loaded || 0;
+              attempt.__lastTime = now;
+
+              sendDownloadProgress(downloadId, {
+                status: "downloading",
+                loaded: progressEvent.loaded || 0,
+                total: progressEvent.total || 0,
+                speed,
+              });
+            },
+          });
+
+          const responseSize = attempt.data?.byteLength ?? attempt.data?.length ?? 0;
+          if (attempt.status === 200 && responseSize > 0) {
+            response = attempt;
+            break;
+          }
+
+          lastStatusOrError = `HTTP ${attempt.status}`;
+          console.warn(`Download failed with status: ${attempt.status}, trying next mirror...`);
+        } catch (err) {
+          if (err.code === "ERR_CANCELED" || axios.isCancel?.(err) || err.name === "CanceledError") {
+            activeDownloads.delete(downloadId);
+            return { ok: false, cancelled: true, error: "Загрузка отменена" };
+          }
+          lastStatusOrError = String(err.message || err);
+          console.warn(`Download error (${lastStatusOrError}), trying next mirror...`);
+        }
       }
 
-      // Decrypt the data using the decryptYandexAudio function
-      const decryptedData = await decryptYandexAudio(response.data, downloadInfo.key);
+      activeDownloads.delete(downloadId);
+
+      if (!response) {
+        sendDownloadProgress(downloadId, { status: "error", error: lastStatusOrError });
+        return { ok: false, error: `Не удалось скачать аудиофайл (${lastStatusOrError})` };
+      }
+
+      sendDownloadProgress(downloadId, { status: "decrypting", loaded: 1, total: 1, speed: 0 });
+
+      // Decrypt the data using the decryptYandexAudio function.
+      // Подменённые (YMLiberty) треки приходят без ключа — они не зашифрованы
+      let decryptedData = response.data;
+      if (downloadInfo.key) {
+        decryptedData = await decryptYandexAudio(response.data, downloadInfo.key);
+      }
+
 
       // Write decrypted data to file synchronously/awaited
       await fs.promises.writeFile(trackFilePath, Buffer.from(decryptedData));
@@ -386,7 +601,10 @@ electron.ipcMain.handle(
 
       // Add metadata
       ffmpegArgs.push("-c", "copy");
-      ffmpegArgs.push("-id3v2_version", "3");
+      // ID3-теги поддерживаются только mp3-контейнером
+      if (fileExtension === "mp3") {
+        ffmpegArgs.push("-id3v2_version", "3");
+      }
 
       if (trackMeta.title) {
         ffmpegArgs.push("-metadata", JSON.stringify(`title=${trackMeta.title}`));
@@ -434,6 +652,9 @@ electron.ipcMain.handle(
             if (fs.existsSync(trackTempFilePath)) {
               fs.unlinkSync(trackTempFilePath);
             }
+            if (fs.existsSync(trackCoverPath)) {
+              fs.unlinkSync(trackCoverPath);
+            }
 
             resolve();
           }
@@ -441,8 +662,17 @@ electron.ipcMain.handle(
 
         console.log("Download completed.");
       });
+
+      sendDownloadProgress(downloadId, { status: "completed", loaded: 1, total: 1, speed: 0 });
+      try {
+        modLog?.info(`[LunaMod] download ok: "${trackFileName}.${fileExtension}"`);
+      } catch (e) {}
     } catch (err) {
       console.error("Download or decryption failed:", err);
+      sendDownloadProgress(downloadId, { status: "error", error: String(err) });
+      try {
+        modLog?.error(`[LunaMod] download failed: "${trackFileName}" — ${err}`);
+      } catch (e) {}
       return { ok: false, error: "Download or decryption failed: " + err };
     }
 
@@ -496,6 +726,16 @@ async function decryptYandexAudio(encryptedData, secretKey) {
 
   let counter = new Uint8Array(16);
   return crypto.subtle.decrypt({ name: "AES-CTR", counter, length: 128 }, cryptoKey, encryptedData);
+}
+
+// Расширение файла по кодеку из get-file-info (mp3/flac/aac/he-aac/flac-mp4/aac-mp4/he-aac-mp4)
+function codecToExtension(codec) {
+  const normalized = String(codec || "").toLowerCase();
+
+  if (normalized.includes("flac")) return "flac";
+  if (normalized.includes("mp4")) return "m4a";
+  if (normalized.includes("aac")) return "aac";
+  return "mp3";
 }
 
 // Discord RPC (из-за того, что main.js не бандлится а просто добавляется в оригинальный index.js, все импорты приходится делать вручную. Строчка ниже просто заменится на содержимое файла src\mod\features\utils\discordRPC.js)
@@ -566,6 +806,98 @@ try {
   }
 } catch (e) {
   console.error("[MediaKeys] Error initializing media keys:", e);
+}
+
+// === Трей-мини-плеер: иконка в системном трее с управлением воспроизведением ===
+let trayPlayer = null;
+let trayCurrentTrackText = "";
+
+function initTrayPlayer() {
+  try {
+    if (trayPlayer || !electron.Tray || !electron.Menu || !electron.nativeImage) return;
+
+    const iconCandidates = [
+      path.join(__dirname, "yandexMusicMod", "tray-icon.png"),
+      path.join(process.resourcesPath || "", "app.ico"),
+      path.join(process.resourcesPath || "", "icon.png"),
+    ];
+
+    let icon = null;
+    for (const candidate of iconCandidates) {
+      try {
+        if (candidate && fs.existsSync(candidate)) {
+          const image = electron.nativeImage.createFromPath(candidate);
+          if (!image.isEmpty()) {
+            icon = image.resize({ width: 16, height: 16 });
+            break;
+          }
+        }
+      } catch (e) {}
+    }
+
+    if (!icon) {
+      console.warn("[Tray] Tray icon not found, mini player disabled");
+      return;
+    }
+
+    trayPlayer = new electron.Tray(icon);
+    trayPlayer.setToolTip("Яндекс Музыка — Luna mod");
+
+    const rebuildMenu = () => {
+      try {
+        trayPlayer.setContextMenu(
+          electron.Menu.buildFromTemplate([
+            { label: trayCurrentTrackText || "Яндекс Музыка", enabled: false },
+            { type: "separator" },
+            { label: "Пауза / Продолжить", click: () => dispatchPlayerAction("PLAY_PAUSE") },
+            { label: "Следующий трек", click: () => dispatchPlayerAction("MOVE_FORWARD") },
+            { label: "Предыдущий трек", click: () => dispatchPlayerAction("MOVE_BACKWARD") },
+            { type: "separator" },
+            {
+              label: "Открыть приложение",
+              click: () => {
+                const win = electron.BrowserWindow.getAllWindows()[0];
+                if (win && !win.isDestroyed()) {
+                  win.show();
+                  win.focus();
+                }
+              },
+            },
+          ]),
+        );
+      } catch (e) {}
+    };
+
+    rebuildMenu();
+
+    // ЛКМ по иконке — пауза / продолжить
+    trayPlayer.on("click", () => dispatchPlayerAction("PLAY_PAUSE"));
+
+    // Название трека в тултипе: рендерер шлёт состояние плеера для Discord RPC
+    electron.ipcMain.on("yandexMusicMod.updateDiscordRpc", (_ev, state) => {
+      try {
+        const meta = state?.data?.trackMeta;
+        if (!meta?.title) return;
+        const artists = (meta.artists || []).map((a) => a.name).filter(Boolean).join(", ");
+        const text = [artists, meta.title].filter(Boolean).join(" — ");
+        if (text && text !== trayCurrentTrackText) {
+          trayCurrentTrackText = text;
+          trayPlayer.setToolTip(text.slice(0, 120));
+          rebuildMenu();
+        }
+      } catch (e) {}
+    });
+
+    console.log("[Tray] Mini player initialized");
+  } catch (e) {
+    console.warn("[Tray] Failed to init tray player:", e);
+  }
+}
+
+if (electron.app.isReady()) {
+  initTrayPlayer();
+} else {
+  electron.app.whenReady().then(initTrayPlayer);
 }
 
 // OSD removed
