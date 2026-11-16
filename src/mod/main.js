@@ -6,6 +6,7 @@ const sanitize = require("sanitize-filename");
 const axios = require("axios");
 const http = require("http");
 const url = require("url");
+const crypto = require("crypto");
 
 // Лог консоли рендера (мод+приложение) в файл — диагностика ошибок скачивания.
 // main.js инлайнится в начало index.js, поэтому переключатели выставляются раньше кода приложения.
@@ -22,7 +23,7 @@ try {
 
 // ffmpeg-static (либа которая бандлит бинарники ffmpeg)
 const pathToFfmpeg = require("ffmpeg-static").replaceAll("app.asar", "app.asar.unpacked");
-const { exec } = require("child_process");
+const { spawn } = require("child_process");
 console.log("bundled ffmpeg binary path:", pathToFfmpeg);
 
 const appFolder = electron.app.getPath("userData");
@@ -64,18 +65,53 @@ if (!fs.existsSync(settingsFilePath)) {
   }
 }
 
+// === Безопасное чтение/запись настроек (файл может отсутствовать или быть повреждён) ===
+function readSettings() {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(settingsFilePath, "utf8") || "{}");
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+  } catch (e) {
+    return {};
+  }
+}
+
+function writeSettings(settings) {
+  try {
+    fs.writeFileSync(settingsFilePath, JSON.stringify(settings, null, 2));
+    return true;
+  } catch (e) {
+    console.error("[Settings] Failed to write settings:", e);
+    return false;
+  }
+}
+
+// Запрет путей прототипного загрязнения
+function isSafeStorageKey(key) {
+  return (
+    typeof key === "string" &&
+    key.length > 0 &&
+    key !== "__proto__" &&
+    key !== "constructor" &&
+    key !== "prototype"
+  );
+}
+
 // window API - запрос настроек пользователя
 electron.ipcMain.handle("yandexMusicMod.getStorageValue", (_ev, key) => {
-  const settings = fs.readFileSync(settingsFilePath, "utf8") || "{}";
-  const parsed = JSON.parse(settings);
-  return parsed[key] !== undefined ? parsed[key] : null;
+  if (!isSafeStorageKey(key)) return null;
+  const settings = readSettings();
+  return settings[key] !== undefined ? settings[key] : null;
 });
 
 // window API - установка настроек пользователя
 electron.ipcMain.on("yandexMusicMod.setStorageValue", (_ev, key, value) => {
-  const settings = JSON.parse(fs.readFileSync(settingsFilePath, "utf8"));
+  if (!isSafeStorageKey(key)) return;
+  const settings = readSettings();
   settings[key] = value;
-  fs.writeFileSync(settingsFilePath, JSON.stringify(settings, null, 2));
+  if (!writeSettings(settings)) return;
+
+  // Путь/список локальных фонов хранится в настройках — обновляем белый список медиа-сервера
+  if (key.startsWith("custom-background/")) refreshAllowedMediaFiles();
 
   electron.BrowserWindow.getAllWindows().forEach((window) =>
     window.webContents.send("yandexMusicMod.storageValueUpdated", key, value),
@@ -113,6 +149,9 @@ electron.ipcMain.handle("yandexMusicMod.selectBackgroundFile", async (_ev) => {
     return { success: false, path: null };
   }
 
+  // Файл становится доступен медиа-серверу и readFileAsDataUrl (белый список)
+  addAllowedMediaFile(result.filePaths[0]);
+
   return { success: true, path: result.filePaths[0] };
 });
 
@@ -141,7 +180,7 @@ electron.ipcMain.handle("yandexMusicMod.saveFileWithDialog", async (_ev, options
 // window API - экспорт всех настроек мода в файл (бэкап)
 electron.ipcMain.handle("yandexMusicMod.exportModSettings", async () => {
   try {
-    const settings = JSON.parse(fs.readFileSync(settingsFilePath, "utf8"));
+    const settings = readSettings();
     const payload = {
       type: "luna-mod-backup",
       version: 1,
@@ -188,6 +227,7 @@ electron.ipcMain.handle("yandexMusicMod.importModSettings", async () => {
     }
 
     fs.writeFileSync(settingsFilePath, JSON.stringify(settings, null, 2));
+    refreshAllowedMediaFiles();
 
     // Разослать обновления всем открытым окнам, чтобы настройки применились сразу
     Object.entries(settings).forEach(([key, value]) => {
@@ -203,29 +243,83 @@ electron.ipcMain.handle("yandexMusicMod.importModSettings", async () => {
   }
 });
 
-// window API - чтение локального файла в Base64 Data URL (гарантирует 100% работу картинок без CORS/file:// ограничений)
+// === Белый список локальных медиа-файлов (фоны) ===
+// Локальный файл можно читать/стримить ТОЛЬКО если пользователь выбрал его
+// через диалог или он сохранён в настройках кастомного фона.
+const ALLOWED_MEDIA_EXTENSIONS = new Set([
+  ".mp4", ".webm", ".mkv", ".mov", ".ogv",
+  ".png", ".jpg", ".jpeg", ".webp", ".gif",
+]);
+
+const IMAGE_MIME_TYPES = {
+  ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".webp": "image/webp",
+  ".gif": "image/gif",
+};
+
+const VIDEO_MIME_TYPES = {
+  ".mp4": "video/mp4",
+  ".webm": "video/webm",
+  ".mkv": "video/x-matroska",
+  ".mov": "video/quicktime",
+  ".ogv": "video/ogg",
+};
+
+const allowedMediaFiles = new Set();
+
+function addAllowedMediaFile(filePath) {
+  if (typeof filePath !== "string" || !filePath) return;
+  // http(s)/data ссылки в белый список не попадают (они и так не читаются с диска).
+  // NB: не использовать общий regex схем — "C:\..." для него тоже схема!
+  if (
+    filePath.startsWith("http://") ||
+    filePath.startsWith("https://") ||
+    filePath.startsWith("data:") ||
+    filePath.startsWith("file:")
+  ) {
+    return;
+  }
+  try {
+    const resolved = path.resolve(filePath);
+    if (!ALLOWED_MEDIA_EXTENSIONS.has(path.extname(resolved).toLowerCase())) return;
+    if (!fs.existsSync(resolved)) return;
+    allowedMediaFiles.add(resolved);
+  } catch (e) {}
+}
+
+// Восстанавливаем белый список из сохранённых настроек фона
+function refreshAllowedMediaFiles() {
+  const settings = readSettings();
+  addAllowedMediaFile(settings["custom-background/path"]);
+  const savedList = settings["custom-background/savedList"];
+  if (Array.isArray(savedList)) {
+    savedList.forEach((item) => addAllowedMediaFile(item && item.path));
+  }
+}
+refreshAllowedMediaFiles();
+
+// window API - чтение локального файла в Base64 Data URL (только картинки из белого списка)
 electron.ipcMain.handle("yandexMusicMod.readFileAsDataUrl", async (_ev, filePath) => {
   try {
-    if (!filePath || !fs.existsSync(filePath)) {
-      return { success: false, error: "File not found" };
+    if (typeof filePath !== "string" || !filePath) {
+      return { success: false, error: "Invalid path" };
     }
-    const stat = fs.statSync(filePath);
+    const resolved = path.resolve(filePath);
+    if (!allowedMediaFiles.has(resolved)) {
+      return { success: false, error: "File is not in the allowed background list" };
+    }
+    const ext = path.extname(resolved).toLowerCase();
+    const mime = IMAGE_MIME_TYPES[ext];
+    if (!mime) {
+      return { success: false, error: "Only image files are supported" };
+    }
+    const stat = fs.statSync(resolved);
     if (stat.size > 25 * 1024 * 1024) {
       return { success: false, error: "File is too large for Data URL (>25MB), use media server" };
     }
-    const ext = path.extname(filePath).toLowerCase();
-    const mimeTypes = {
-      ".png": "image/png",
-      ".jpg": "image/jpeg",
-      ".jpeg": "image/jpeg",
-      ".webp": "image/webp",
-      ".gif": "image/gif",
-      ".svg": "image/svg+xml",
-      ".bmp": "image/bmp",
-      ".ico": "image/x-icon",
-    };
-    const mime = mimeTypes[ext] || "application/octet-stream";
-    const data = fs.readFileSync(filePath);
+    const data = fs.readFileSync(resolved);
     return { success: true, dataUrl: `data:${mime};base64,${data.toString("base64")}` };
   } catch (err) {
     console.error("[MediaServer] Error reading file as data URL:", err);
@@ -233,91 +327,104 @@ electron.ipcMain.handle("yandexMusicMod.readFileAsDataUrl", async (_ev, filePath
   }
 });
 
-// Локальный HTTP сервер для стриминга видео и медиа фона без ограничений браузера
+// === Локальный HTTP сервер для стриминга видео/медиа фона ===
+// Защита: случайный токен при каждом запуске + белый список файлов + фиксированный набор расширений.
+// CORS не выдаём — <video>/<img> внутри приложения работают и без него,
+// а чужие сайты не могут ни перебрать порт+токен, ни прочитать ответ.
+const mediaServerToken = crypto.randomBytes(32).toString("hex");
 let mediaServerPort = 0;
+
+function sendMediaError(res, code, message) {
+  res.writeHead(code, { "Content-Type": "text/plain" });
+  res.end(message);
+}
+
 const mediaServer = http.createServer((req, res) => {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "*");
-
-  if (req.method === "OPTIONS") {
-    res.writeHead(204);
-    res.end();
-    return;
-  }
-
   const parsedUrl = url.parse(req.url, true);
-  if (parsedUrl.pathname === "/media") {
-    const filePath = parsedUrl.query.file;
-    if (!filePath || !fs.existsSync(filePath)) {
-      res.writeHead(404, { "Content-Type": "text/plain" });
-      res.end("File not found");
-      return;
-    }
-
-    try {
-      const stat = fs.statSync(filePath);
-      const fileSize = stat.size;
-      const ext = path.extname(filePath).toLowerCase();
-
-      const mimeTypes = {
-        ".mp4": "video/mp4",
-        ".webm": "video/webm",
-        ".mkv": "video/x-matroska",
-        ".mov": "video/quicktime",
-        ".ogv": "video/ogg",
-        ".png": "image/png",
-        ".jpg": "image/jpeg",
-        ".jpeg": "image/jpeg",
-        ".webp": "image/webp",
-        ".gif": "image/gif",
-        ".svg": "image/svg+xml",
-      };
-      const contentType = mimeTypes[ext] || "application/octet-stream";
-
-      const range = req.headers.range;
-      if (range) {
-        const parts = range.replace(/bytes=/, "").split("-");
-        const start = parseInt(parts[0], 10);
-        const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
-
-        if (start >= fileSize) {
-          res.writeHead(416, { "Content-Range": `bytes */${fileSize}` });
-          res.end();
-          return;
-        }
-
-        const chunksize = end - start + 1;
-        const file = fs.createReadStream(filePath, { start, end });
-        const head = {
-          "Content-Range": `bytes ${start}-${end}/${fileSize}`,
-          "Accept-Ranges": "bytes",
-          "Content-Length": chunksize,
-          "Content-Type": contentType,
-          "Access-Control-Allow-Origin": "*",
-        };
-        res.writeHead(206, head);
-        file.pipe(res);
-      } else {
-        const head = {
-          "Content-Length": fileSize,
-          "Content-Type": contentType,
-          "Accept-Ranges": "bytes",
-          "Access-Control-Allow-Origin": "*",
-        };
-        res.writeHead(200, head);
-        fs.createReadStream(filePath).pipe(res);
-      }
-    } catch (err) {
-      console.error("[MediaServer] Error streaming file:", err);
-      res.writeHead(500, { "Content-Type": "text/plain" });
-      res.end("Internal Server Error");
-    }
+  if (parsedUrl.pathname !== "/media" || (req.method !== "GET" && req.method !== "HEAD")) {
+    sendMediaError(res, 404, "Not found");
     return;
   }
 
-  res.writeHead(404);
-  res.end();
+  // Токен выдаётся только рендереру через IPC — внешние сайты его не знают
+  if (parsedUrl.query.token !== mediaServerToken) {
+    sendMediaError(res, 403, "Forbidden");
+    return;
+  }
+
+  const filePath = parsedUrl.query.file;
+  const resolved = typeof filePath === "string" ? path.resolve(filePath) : "";
+  if (!resolved || !allowedMediaFiles.has(resolved)) {
+    sendMediaError(res, 403, "File is not in the allowed background list");
+    return;
+  }
+
+  const ext = path.extname(resolved).toLowerCase();
+  const contentType = VIDEO_MIME_TYPES[ext] || IMAGE_MIME_TYPES[ext];
+  if (!contentType) {
+    sendMediaError(res, 404, "Unsupported media type");
+    return;
+  }
+
+  try {
+    const stat = fs.statSync(resolved);
+    const fileSize = stat.size;
+
+    // Range-запросы (перемотка видео). Поддержка "bytes=N-", "bytes=N-M" и суффиксного "bytes=-N"
+    const range = req.headers.range;
+    if (range) {
+      const parts = range.replace(/bytes=/i, "").split("-");
+      let start = parts[0] === "" ? NaN : parseInt(parts[0], 10);
+      let end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
+      if (Number.isNaN(start)) {
+        // суффиксный range "bytes=-N": последние N байт (N лежит в parts[1])
+        const suffixLength = parseInt(parts[1], 10);
+        start = Math.max(0, fileSize - (Number.isNaN(suffixLength) ? 0 : suffixLength));
+        end = fileSize - 1;
+      }
+      start = Math.max(0, start);
+      end = Math.min(fileSize - 1, end);
+
+      if (Number.isNaN(start) || Number.isNaN(end) || start > end || start >= fileSize) {
+        res.writeHead(416, { "Content-Range": `bytes */${fileSize}` });
+        res.end();
+        return;
+      }
+
+      const chunksize = end - start + 1;
+      const head = {
+        "Content-Range": `bytes ${start}-${end}/${fileSize}`,
+        "Accept-Ranges": "bytes",
+        "Content-Length": chunksize,
+        "Content-Type": contentType,
+      };
+      res.writeHead(206, head);
+      if (req.method === "HEAD") {
+        res.end();
+        return;
+      }
+      const file = fs.createReadStream(resolved, { start, end });
+      file.on("error", () => res.end());
+      file.pipe(res);
+    } else {
+      const head = {
+        "Content-Length": fileSize,
+        "Content-Type": contentType,
+        "Accept-Ranges": "bytes",
+      };
+      res.writeHead(200, head);
+      if (req.method === "HEAD") {
+        res.end();
+        return;
+      }
+      const file = fs.createReadStream(resolved);
+      file.on("error", () => res.end());
+      file.pipe(res);
+    }
+  } catch (err) {
+    console.error("[MediaServer] Error streaming file:", err);
+    sendMediaError(res, 500, "Internal Server Error");
+  }
 });
 
 mediaServer.listen(0, "127.0.0.1", () => {
@@ -325,8 +432,9 @@ mediaServer.listen(0, "127.0.0.1", () => {
   console.log(`[MediaServer] Custom background media server listening on 127.0.0.1:${mediaServerPort}`);
 });
 
+// window API - адрес и токен медиа-сервера (токен живёт до перезапуска приложения)
 electron.ipcMain.handle("yandexMusicMod.getMediaServerPort", () => {
-  return mediaServerPort;
+  return { port: mediaServerPort, token: mediaServerToken };
 });
 
 // Автоматическое повышение качества обложек и баннеров до максимального разрешения
@@ -355,16 +463,27 @@ try {
   console.warn("[HighResImages] Failed to init high-res images interceptor:", e);
 }
 
-// Intercept headers to provide CORS headers for audio streaming and custom media
+// Intercept headers to provide CORS headers for audio streaming and custom media.
+// ВАЖНО: CORS-заголовки выдаются ТОЛЬКО для доменов Яндекса — глобальный "*"
+// на все ответы позволял бы любым сторонним скриптам/страницам в окне
+// свободно читать ответы и злоупотреблять API.
 try {
   const registerCorsHeaders = () => {
     try {
+      const corsAllowedUrlPattern = /^https?:\/\/([\w.-]*\.)?(yandex\.ru|yandex\.net|yandex\.com)(:\d+)?\//i;
       electron.session.defaultSession.webRequest.onHeadersReceived((details, callback) => {
-        const responseHeaders = details.responseHeaders || {};
-        responseHeaders["Access-Control-Allow-Origin"] = ["*"];
-        responseHeaders["Access-Control-Allow-Headers"] = ["*"];
-        responseHeaders["Access-Control-Allow-Methods"] = ["GET, POST, OPTIONS, HEAD"];
-        callback({ responseHeaders });
+        try {
+          if (!corsAllowedUrlPattern.test(details.url)) {
+            return callback({});
+          }
+          const responseHeaders = details.responseHeaders || {};
+          responseHeaders["Access-Control-Allow-Origin"] = ["*"];
+          responseHeaders["Access-Control-Allow-Headers"] = ["*"];
+          responseHeaders["Access-Control-Allow-Methods"] = ["GET, POST, OPTIONS, HEAD"];
+          callback({ responseHeaders });
+        } catch (err) {
+          callback({});
+        }
       });
     } catch (err) {
       console.warn("[CORS] Failed to register onHeadersReceived:", err);
@@ -393,10 +512,12 @@ electron.ipcMain.handle("yandexMusicMod.openFolder", async (_ev, folderPath) => 
     if (!target) {
       // путь не задан — открываем дефолтную папку загрузок
       target = defaultDownloadPath;
-      try {
-        const settings = JSON.parse(fs.readFileSync(settingsFilePath, "utf8"));
-        target = settings.downloadFolderPath || target;
-      } catch (e) {}
+      const settings = readSettings();
+      target = settings.downloadFolderPath || target;
+    }
+    // Открываем только существующие каталоги: shell.openPath на файле запустил бы его
+    if (!fs.existsSync(target) || !fs.statSync(target).isDirectory()) {
+      return { success: false, error: "Папка не найдена" };
     }
     await electron.shell.openPath(target);
     return { success: true };
@@ -428,6 +549,37 @@ electron.ipcMain.on("yandexMusicMod.cancelDownload", (_ev, downloadId) => {
   }
 });
 
+// Запуск ffmpeg через spawn (без shell): кавычки, %, & в названиях треков безопасны.
+// Возвращает промис, отклоняется при ненулевом коде выхода или таймауте.
+function runFfmpeg(args, timeoutMs = 180000) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(pathToFfmpeg, args, { windowsHide: true });
+    let stderr = "";
+    const timer = setTimeout(() => {
+      try {
+        child.kill();
+      } catch (e) {}
+      reject(new Error("FFmpeg timed out"));
+    }, timeoutMs);
+
+    child.stderr.on("data", (chunk) => {
+      if (stderr.length < 8000) stderr += chunk.toString();
+    });
+    child.on("error", (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      if (code === 0) {
+        resolve();
+      } else {
+        reject(new Error(`FFmpeg exited with code ${code}. ${stderr.slice(-1500)}`));
+      }
+    });
+  });
+}
+
 // window API - загрузка трека
 electron.ipcMain.handle(
   "yandexMusicMod.downloadTrack",
@@ -458,12 +610,7 @@ electron.ipcMain.handle(
     if (customDownloadPath) {
       saveFolder = customDownloadPath;
     } else {
-      try {
-        const settings = JSON.parse(fs.readFileSync(settingsFilePath, "utf8"));
-        saveFolder = settings.downloadFolderPath || saveFolder;
-      } catch (e) {
-        console.error("Failed to parse settings:", e);
-      }
+      saveFolder = readSettings().downloadFolderPath || saveFolder;
     }
 
     if (!fs.existsSync(saveFolder)) {
@@ -472,14 +619,19 @@ electron.ipcMain.handle(
 
     // Generate filename from trackMeta or use default
     const fileExtension = codecToExtension(downloadInfo.codec);
+    const artists = Array.isArray(trackMeta?.artists) ? trackMeta.artists : [];
     const trackFileName = sanitize(
-      `${trackMeta.artists.map((a) => a.name).join(", ")} - ${trackMeta.title} ${trackMeta.version || ""}`,
+      `${artists.map((a) => a.name).join(", ")} - ${trackMeta?.title || "track"} ${trackMeta?.version || ""}`,
     )
       .trim()
       .substring(0, 250);
     const trackFilePath = path.join(saveFolder, `${trackFileName}.${fileExtension}`);
-    const trackTempFilePath = path.join(saveFolder, `${Math.random().toString(36).substring(2, 7)}.${fileExtension}`);
-    const trackCoverPath = trackTempFilePath + ".jpg";
+    // Расшифрованный трек кладём во временный файл: финальный появляется после успешного прохода ffmpeg
+    const trackTempFilePath = path.join(
+      saveFolder,
+      `tmp-${Date.now()}-${Math.random().toString(36).substring(2, 8)}.${fileExtension}`,
+    );
+    const trackCoverPath = `${trackTempFilePath}.jpg`;
 
     try {
       modLog?.info(`[LunaMod] download start: "${trackFileName}.${fileExtension}" -> ${saveFolder} (mirrors: ${candidateUrls.length})`);
@@ -560,40 +712,26 @@ electron.ipcMain.handle(
       }
 
 
-      // Write decrypted data to file synchronously/awaited
-      await fs.promises.writeFile(trackFilePath, Buffer.from(decryptedData));
+      // Write decrypted data to the temp file (final file appears after ffmpeg succeeds)
+      await fs.promises.writeFile(
+        trackTempFilePath,
+        Buffer.isBuffer(decryptedData) ? decryptedData : Buffer.from(decryptedData),
+      );
       console.log("Download and Decryption Completed");
 
-      // 2. Copy/reencode audio using direct ffmpeg command
-      await new Promise((resolve, reject) => {
-        const ffmpegArgs = ["-i", JSON.stringify(trackFilePath), "-y", JSON.stringify(trackTempFilePath)];
-        const command = `${JSON.stringify(pathToFfmpeg)} ${ffmpegArgs.join(" ")}`;
-
-        console.log("Executing FFmpeg command:", command);
-
-        exec(command, (error, stdout, stderr) => {
-          if (error) {
-            console.error("FFmpeg stderr:", stderr);
-            console.error("FFmpeg error:", error);
-            reject(new Error(`FFmpeg process failed. Command: ${command}. Error: ${error.message}`));
-          } else {
-            resolve();
-          }
-        });
-      });
-
-      // Build ffmpeg arguments for adding metadata and cover
-      const ffmpegArgs = ["-i", JSON.stringify(trackTempFilePath)];
+      // 2. Один проход ffmpeg: -c copy (без перекодирования — качество не теряется),
+      // теги и обложка добавляются сразу.
+      const ffmpegArgs = ["-i", trackTempFilePath, "-y"];
 
       // === Download cover art ===
-      if (trackMeta.coverUri) {
+      if (trackMeta?.coverUri) {
         try {
           const url = `https://${trackMeta.coverUri.replaceAll("%%", "orig")}`;
-          const coverResponse = await axios.get(url, { responseType: "arraybuffer" });
+          const coverResponse = await axios.get(url, { responseType: "arraybuffer", timeout: 15000 });
           fs.writeFileSync(trackCoverPath, coverResponse.data);
 
-          ffmpegArgs.push("-i", JSON.stringify(trackCoverPath));
-          ffmpegArgs.push("-map", "0:a", "-map", "1:v", "-y");
+          ffmpegArgs.push("-i", trackCoverPath);
+          ffmpegArgs.push("-map", "0:a", "-map", "1:v");
         } catch (err) {
           console.warn("Failed to download cover art:", err);
         }
@@ -606,62 +744,46 @@ electron.ipcMain.handle(
         ffmpegArgs.push("-id3v2_version", "3");
       }
 
-      if (trackMeta.title) {
-        ffmpegArgs.push("-metadata", JSON.stringify(`title=${trackMeta.title}`));
+      if (trackMeta?.title) {
+        ffmpegArgs.push("-metadata", `title=${trackMeta.title}`);
       }
-      if (trackMeta.version) {
-        ffmpegArgs.push("-metadata", JSON.stringify(`subtitle=${trackMeta.version}`));
+      if (trackMeta?.version) {
+        ffmpegArgs.push("-metadata", `subtitle=${trackMeta.version}`);
       }
-      if (trackMeta.artists && trackMeta.artists.length > 0) {
-        ffmpegArgs.push("-metadata", JSON.stringify(`artist=${trackMeta.artists.map((a) => a.name).join("/")}`));
+      if (artists.length > 0) {
+        ffmpegArgs.push("-metadata", `artist=${artists.map((a) => a.name).join("/")}`);
       }
-      if (trackMeta.albums?.[0]?.title) {
-        ffmpegArgs.push("-metadata", JSON.stringify(`album=${trackMeta.albums[0].title}`));
+      if (trackMeta?.albums?.[0]?.title) {
+        ffmpegArgs.push("-metadata", `album=${trackMeta.albums[0].title}`);
       }
-      if (trackMeta.albums?.[0]?.genre) {
-        ffmpegArgs.push("-metadata", JSON.stringify(`genre=${trackMeta.albums[0].genre}`));
+      if (trackMeta?.albums?.[0]?.genre) {
+        ffmpegArgs.push("-metadata", `genre=${trackMeta.albums[0].genre}`);
       }
-      if (trackMeta.albums?.[0]?.trackPosition?.index) {
-        ffmpegArgs.push("-metadata", JSON.stringify(`track=${trackMeta.albums[0].trackPosition.index}`));
+      if (trackMeta?.albums?.[0]?.trackPosition?.index) {
+        ffmpegArgs.push("-metadata", `track=${trackMeta.albums[0].trackPosition.index}`);
       }
-      if (trackMeta.albums?.[0]?.year) {
-        ffmpegArgs.push("-metadata", JSON.stringify(`date=${trackMeta.albums[0].year}`));
+      if (trackMeta?.albums?.[0]?.year) {
+        ffmpegArgs.push("-metadata", `date=${trackMeta.albums[0].year}`);
       }
-      if (trackMeta.albums?.[0]?.releaseDate) {
-        ffmpegArgs.push("-metadata", JSON.stringify(`releaseDate=${trackMeta.albums[0].releaseDate}`));
+      if (trackMeta?.albums?.[0]?.releaseDate) {
+        ffmpegArgs.push("-metadata", `releaseDate=${trackMeta.albums[0].releaseDate}`);
       }
-      ffmpegArgs.push("-metadata", JSON.stringify("encoded_by=yandexMusicMod"));
+      ffmpegArgs.push("-metadata", "encoded_by=yandexMusicMod");
 
-      ffmpegArgs.push(JSON.stringify(trackFilePath));
+      ffmpegArgs.push(trackFilePath);
 
-      console.log("ffmpegArgs", ffmpegArgs);
+      // Execute ffmpeg: spawn без shell — кавычки и спецсимволы в названиях безопасны
+      await runFfmpeg(ffmpegArgs);
 
-      // Execute ffmpeg command to add metadata and cover
-      await new Promise((resolve, reject) => {
-        const command = `${JSON.stringify(pathToFfmpeg)} ${ffmpegArgs.join(" ")}`;
-
-        console.log("Executing FFmpeg metadata command:", command);
-
-        exec(command, (error, stdout, stderr) => {
-          if (error) {
-            console.error("FFmpeg metadata stderr:", stderr);
-            console.error("FFmpeg metadata error:", error);
-            reject(new Error(`FFmpeg metadata process failed. Command: ${command}. Error: ${error.message}`));
-          } else {
-            // Clean up temporary files
-            if (fs.existsSync(trackTempFilePath)) {
-              fs.unlinkSync(trackTempFilePath);
-            }
-            if (fs.existsSync(trackCoverPath)) {
-              fs.unlinkSync(trackCoverPath);
-            }
-
-            resolve();
-          }
-        });
-
-        console.log("Download completed.");
-      });
+      // Clean up temporary files
+      try {
+        if (fs.existsSync(trackTempFilePath)) {
+          fs.unlinkSync(trackTempFilePath);
+        }
+        if (fs.existsSync(trackCoverPath)) {
+          fs.unlinkSync(trackCoverPath);
+        }
+      } catch (e) {}
 
       sendDownloadProgress(downloadId, { status: "completed", loaded: 1, total: 1, speed: 0 });
       try {
@@ -670,6 +792,12 @@ electron.ipcMain.handle(
     } catch (err) {
       console.error("Download or decryption failed:", err);
       sendDownloadProgress(downloadId, { status: "error", error: String(err) });
+      // Не оставляем мусор: временные файлы и недописанный финал
+      try {
+        for (const p of [trackTempFilePath, trackCoverPath, trackFilePath]) {
+          if (fs.existsSync(p)) fs.unlinkSync(p);
+        }
+      } catch (e) {}
       try {
         modLog?.error(`[LunaMod] download failed: "${trackFileName}" — ${err}`);
       } catch (e) {}
@@ -689,31 +817,55 @@ electron.ipcMain.on("yandexMusicMod.openDownloadDirectory", async (_ev) => {
     saveFolder = (process.env.HOME || process.env.USERPROFILE) + "/YandexMod Download";
   }
 
-  try {
-    const settings = JSON.parse(fs.readFileSync(settingsFilePath, "utf8"));
-    saveFolder = settings.downloadFolderPath || saveFolder;
-  } catch (e) {
-    console.log("failed to parse settings", e);
-  }
+  saveFolder = readSettings().downloadFolderPath || saveFolder;
 
   await electron.shell.openPath(saveFolder);
 });
 
 // window API - универсальный axios запрос
+// Ограничения: только http/https, запрет localhost/приватных адресов (SSRF) и лимит размера ответа
+const BLOCKED_AXIOS_HOSTS = /^(localhost|127\.|0\.0\.0\.0|10\.|192\.168\.|169\.254\.|\[::1\]|::1)/;
+const AXIOS_MAX_RESPONSE_BYTES = 10 * 1024 * 1024;
+
 electron.ipcMain.handle("yandexMusicMod.axios", async (_ev, config) => {
-  const client = axios.create({
-    validateStatus: () => true,
-  });
+  try {
+    if (!config || typeof config !== "object" || typeof config.url !== "string") {
+      return { success: false, error: "Invalid request config" };
+    }
 
-  const response = await client(config);
+    let target;
+    try {
+      target = new URL(config.url, config.baseURL);
+    } catch (e) {
+      return { success: false, error: "Invalid URL" };
+    }
 
-  return {
-    success: true,
-    data: response.data,
-    status: response.status,
-    statusText: response.statusText,
-    headers: response.headers,
-  };
+    if (target.protocol !== "http:" && target.protocol !== "https:") {
+      return { success: false, error: "Unsupported protocol" };
+    }
+    if (BLOCKED_AXIOS_HOSTS.test(target.hostname)) {
+      return { success: false, error: "Requests to local/private addresses are not allowed" };
+    }
+
+    const client = axios.create({
+      validateStatus: () => true,
+      timeout: 20000,
+      maxContentLength: AXIOS_MAX_RESPONSE_BYTES,
+    });
+
+    const response = await client(config);
+
+    return {
+      success: true,
+      data: response.data,
+      status: response.status,
+      statusText: response.statusText,
+      headers: response.headers,
+    };
+  } catch (err) {
+    console.error("[AxiosProxy] Request failed:", err.message);
+    return { success: false, error: err.message };
+  }
 });
 
 // Функция для расшифровки зашифрованного трека

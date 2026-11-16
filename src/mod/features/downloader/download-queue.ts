@@ -15,6 +15,10 @@ export interface QueueItem {
   downloadedBytes: number;
   totalBytes: number;
   speedBytesPerSec: number;
+  /** качество и папка фиксируются на момент постановки в очередь, чтобы
+   * новая партия с другими настройками не меняла их у уже ожидающих треков */
+  quality: QualityEnum;
+  folderPath: string;
   error?: string;
   /** показать тост по завершении (для одиночных треков из контекстного меню) */
   notify?: boolean;
@@ -27,8 +31,6 @@ const order: string[] = [];
 const listeners = new Set<() => void>();
 let running = 0;
 let counter = 0;
-let queueQuality: QualityEnum = QualityEnum.LOSSLESS;
-let queueFolder = "";
 
 // Кэш снапшота: useSyncExternalStore требует стабильную ссылку между рендерами,
 // иначе React уходит в бесконечный ре-рендер и крашит дерево
@@ -105,7 +107,7 @@ function notifySuccess(item: QueueItem) {
     description: `${item.artistsText ? item.artistsText + " — " : ""}${item.title}`,
     action: {
       label: "Папка",
-      onClick: () => window.yandexMusicMod.openFolder(queueFolder || ""),
+      onClick: () => window.yandexMusicMod.openFolder(item.folderPath || ""),
     },
   });
 }
@@ -116,13 +118,13 @@ function notifyFailure(item: QueueItem, error?: string) {
   });
 }
 
-async function processItem(item: QueueItem, quality: QualityEnum, folderPath: string) {
+async function processItem(item: QueueItem) {
   running += 1;
   patchItem(item.id, { status: "downloading" });
-  console.log(`[DownloadQueue] started: ${item.trackId} "${item.title}" quality=${quality}`);
+  console.log(`[DownloadQueue] started: ${item.trackId} "${item.title}" quality=${item.quality}`);
 
   try {
-    const downloadInfo = await getTrackUrl(item.trackId, quality);
+    const downloadInfo = await getTrackUrl(item.trackId, item.quality);
 
     if (downloadInfo.isErr()) {
       console.error(`[DownloadQueue] getTrackUrl failed for ${item.trackId}:`, downloadInfo.error);
@@ -138,7 +140,7 @@ async function processItem(item: QueueItem, quality: QualityEnum, folderPath: st
       coverUri: item.coverUri || undefined,
     };
 
-    const result = await window.yandexMusicMod.downloadTrack(downloadInfo.value, meta, folderPath, item.id);
+    const result = await window.yandexMusicMod.downloadTrack(downloadInfo.value, meta, item.folderPath, item.id);
     console.log(`[DownloadQueue] main download result for ${item.trackId}:`, JSON.stringify(result));
 
     if (result?.cancelled) {
@@ -164,7 +166,7 @@ function pump() {
     const next = getQueueSnapshot().find((i) => i.status === "pending");
     if (!next) break;
     patchItem(next.id, { status: "downloading" });
-    processItem(next, queueQuality, queueFolder);
+    processItem(next);
   }
 }
 
@@ -203,15 +205,14 @@ export function enqueueTracks(
       downloadedBytes: 0,
       totalBytes: 0,
       speedBytesPerSec: 0,
+      // качество и папка фиксируются на момент постановки в очередь
+      quality,
+      folderPath: folderPath || "",
       // одиночная загрузка — уведомляем о результате тостом
       notify: tracks.length === 1,
     });
     added += 1;
   }
-
-  // Качество и папка фиксируются на момент постановки в очередь
-  queueQuality = quality;
-  queueFolder = folderPath || "";
 
   pump();
   return { added, duplicates };

@@ -30,6 +30,8 @@ const yandexMusicClient: AxiosInstance = axios.create({
   headers: headers,
   // Prevent axios from throwing on HTTP error status codes
   validateStatus: () => true,
+  // без таймаута запрос мог висеть вечно и молча блокировать скачивание
+  timeout: 15000,
 });
 
 // HMAC sign function
@@ -95,11 +97,12 @@ export async function getTrackUrl(trackId: string, quality: QualityEnum): Promis
     }
 
     const ts = Math.floor(Date.now() / 1000);
-    const audioСodecs = ["flac", "aac", "he-aac", "mp3", "flac-mp4", "aac-mp4", "he-aac-mp4"];
+    // NB: раньше тут была кириллическая «С» в audioСodecs — работало, но баг при поиске/рефакторинге
+    const audioCodecs = ["flac", "aac", "he-aac", "mp3", "flac-mp4", "aac-mp4", "he-aac-mp4"];
     const transports = "encraw";
 
     const signResult = await getSign({
-      data: `${ts}${trackId}${quality}${audioСodecs.join("")}${transports}`,
+      data: `${ts}${trackId}${quality}${audioCodecs.join("")}${transports}`,
       secretKey: SECRET_KEY,
     });
 
@@ -109,7 +112,7 @@ export async function getTrackUrl(trackId: string, quality: QualityEnum): Promis
 
     for (let i = 0; i < 10; i++) {
       const response = await yandexMusicClient.get(
-        `/get-file-info?ts=${ts}&trackId=${trackId}&quality=${quality}&codecs=${encodeURIComponent(audioСodecs.join(","))}&transports=${transports}&sign=${encodeURIComponent(signResult.value)}`,
+        `/get-file-info?ts=${ts}&trackId=${trackId}&quality=${quality}&codecs=${encodeURIComponent(audioCodecs.join(","))}&transports=${transports}&sign=${encodeURIComponent(signResult.value)}`,
       );
 
       if (response.status !== 200) {

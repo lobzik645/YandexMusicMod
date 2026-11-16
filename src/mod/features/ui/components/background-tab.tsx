@@ -66,11 +66,11 @@ const DEFAULT_PRESETS: SavedBackground[] = [
 
 function BackgroundThumbnail({
   item,
-  port,
+  info,
   className,
 }: {
   item: SavedBackground;
-  port: number | null;
+  info: { port: number; token: string } | null;
   className?: string;
 }) {
   const [dataUrl, setDataUrl] = useState<string | null>(null);
@@ -85,8 +85,10 @@ function BackgroundThumbnail({
     if (item.path.startsWith("http://") || item.path.startsWith("https://")) {
       setDataUrl(item.path);
     } else {
-      if (port) {
-        setDataUrl(`http://127.0.0.1:${port}/media?file=${encodeURIComponent(item.path)}`);
+      if (info && info.port > 0 && info.token) {
+        setDataUrl(
+          `http://127.0.0.1:${info.port}/media?file=${encodeURIComponent(item.path)}&token=${info.token}`,
+        );
       } else {
         window.yandexMusicMod
           .readFileAsDataUrl(item.path)
@@ -106,7 +108,7 @@ function BackgroundThumbnail({
     return () => {
       isCancelled = true;
     };
-  }, [item.path, port]);
+  }, [item.path, info]);
 
   if (isError || !dataUrl) {
     return (
@@ -150,7 +152,7 @@ export function BackgroundTab() {
   const [savedList, setSavedList] = useState<SavedBackground[]>([]);
   const [urlInput, setUrlInput] = useState("");
   const [showUrlInput, setShowUrlInput] = useState(false);
-  const [mediaPort, setMediaPort] = useState<number | null>(null);
+  const [mediaInfo, setMediaInfo] = useState<{ port: number; token: string } | null>(null);
 
   // Display settings
   const [opacity, setOpacity] = useState(100);
@@ -164,7 +166,7 @@ export function BackgroundTab() {
   useEffect(() => {
     window.yandexMusicMod
       .getMediaServerPort()
-      .then(setMediaPort)
+      .then((info: { port: number; token: string } | null) => setMediaInfo(info && info.port > 0 ? info : null))
       .catch(() => {});
 
     (async () => {
@@ -230,7 +232,7 @@ export function BackgroundTab() {
     const filtered = savedList.filter((item) => item.id !== id);
     saveList(filtered);
     if (currentPath === itemToDelete?.path) {
-      if (filtered.length > 0) {
+      if (filtered.length > 0 && filtered[0]) {
         handleSelectBackground(filtered[0]);
       } else {
         setCurrentPath("");
@@ -316,7 +318,7 @@ export function BackgroundTab() {
                   path: currentPath,
                   isVideo: /\.(mp4|webm|mkv|mov)$/i.test(currentPath),
                 }}
-                port={mediaPort}
+                info={mediaInfo}
                 className="h-full w-full"
               />
               <div className="absolute top-1 left-1 rounded bg-purple-600 px-1.5 py-0.5 text-[9px] font-bold text-white shadow">
@@ -415,7 +417,7 @@ export function BackgroundTab() {
                     isActive ? "border-purple-400/70 shadow-sm" : "border-white/10"
                   }`}
                 >
-                  <BackgroundThumbnail item={item} port={mediaPort} className="h-full w-full" />
+                  <BackgroundThumbnail item={item} info={mediaInfo} className="h-full w-full" />
                   {isActive && (
                     <div className="absolute top-1 right-1 rounded-full bg-purple-500 p-0.5 shadow">
                       <Check className="h-2.5 w-2.5 text-white" />

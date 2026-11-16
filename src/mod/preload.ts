@@ -31,6 +31,7 @@ electron.contextBridge.exposeInMainWorld("yandexMusicMod", {
   openFolder: (folderPath: string) => electron.ipcRenderer.invoke("yandexMusicMod.openFolder", folderPath),
   axios: (config: any) => electron.ipcRenderer.invoke("yandexMusicMod.axios", config),
   selectBackgroundFile: () => electron.ipcRenderer.invoke("yandexMusicMod.selectBackgroundFile"),
+  // Возвращает { port: number, token: string } — токен обязателен в запросах /media
   getMediaServerPort: () => electron.ipcRenderer.invoke("yandexMusicMod.getMediaServerPort"),
   readFileAsDataUrl: (filePath: string) => electron.ipcRenderer.invoke("yandexMusicMod.readFileAsDataUrl", filePath),
   sendPlayerAction: (action: string) => electron.ipcRenderer.send("yandexMusicMod.sendPlayerAction", action),

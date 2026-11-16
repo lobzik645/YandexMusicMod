@@ -24,7 +24,7 @@ declare global {
       selectDownloadFolder: () => Promise<{ success: boolean; path: string | null }>;
       openFolder: (folderPath: string) => Promise<{ success: boolean; error?: string }>;
       selectBackgroundFile: () => Promise<{ success: boolean; path: string | null }>;
-      getMediaServerPort: () => Promise<number>;
+      getMediaServerPort: () => Promise<{ port: number; token: string }>;
       readFileAsDataUrl: (filePath: string) => Promise<{ success: boolean; dataUrl?: string; error?: string }>;
       sendPlayerAction: (action: string) => void;
       showOsd: (payload: any) => void;

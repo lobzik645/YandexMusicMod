@@ -3,7 +3,7 @@ const STYLES_ID = "ym-custom-background-styles";
 
 export function isVideoFile(path: string): boolean {
   if (!path) return false;
-  const clean = path.toLowerCase().split("?")[0].split("#")[0];
+  const clean = (path.toLowerCase().split("?")[0] ?? path).split("#")[0] ?? path;
   return (
     clean.endsWith(".mp4") ||
     clean.endsWith(".webm") ||
@@ -39,9 +39,9 @@ export async function toMediaUrl(path: string): Promise<string> {
   // Для видео (и как резерв для картинок) используем встроенный HTTP стрим-сервер
   if (window.yandexMusicMod?.getMediaServerPort) {
     try {
-      const port = await window.yandexMusicMod.getMediaServerPort();
-      if (port && port > 0) {
-        return `http://127.0.0.1:${port}/media?file=${encodeURIComponent(trimmed)}`;
+      const info = await window.yandexMusicMod.getMediaServerPort();
+      if (info && info.port > 0 && info.token) {
+        return `http://127.0.0.1:${info.port}/media?file=${encodeURIComponent(trimmed)}&token=${info.token}`;
       }
     } catch (e) {
       console.warn("[CustomBackground] getMediaServerPort failed:", e);

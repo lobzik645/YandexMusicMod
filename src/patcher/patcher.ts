@@ -365,7 +365,14 @@ export async function processBuild(build: AppBuild) {
 
   console.log(`\n---- 🚧 Building renderer.js ----`);
 
-  await $`${process.execPath} run ui:build`;
+  const distRenderer = path.join(modCompiledDir, "renderer.js");
+  if (process.env.LUNA_SKIP_UI_BUILD && fs.existsSync(distRenderer)) {
+    // Переиспользуем уже собранный src/mod/dist/renderer.js (быстрая пересборка установщика
+    // без тяжёлого vite; сам dist нужно собрать заранее: bun run ui:build)
+    console.log(`LUNA_SKIP_UI_BUILD=1 — переиспользуем готовый ${distRenderer}`);
+  } else {
+    await $`${process.execPath} run ui:build`;
+  }
 
   console.log(`\n---- 🚧 Building preload.js ----`);
 
